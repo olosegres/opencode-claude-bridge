@@ -1,3 +1,6 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   createAuthorizationRequest,
   exchangeCodeForTokens,
@@ -86,6 +89,32 @@ type PluginClient = {
 
 const CLAUDE_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude.";
+const ANTHROPIC_ERROR_LOG_PATH = join(
+  homedir(),
+  ".local",
+  "share",
+  "opencode",
+  "log",
+  "anthropic-api-errors.log",
+);
+const RETRYABLE_STATUSES = new Set([429, 529]);
+
+function getResponseRetryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const retryAfterSeconds = Number(retryAfter);
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+      return retryAfterSeconds * 1000;
+    }
+
+    const retryAfterDate = Date.parse(retryAfter);
+    if (Number.isFinite(retryAfterDate)) {
+      return Math.max(retryAfterDate - Date.now(), 0);
+    }
+  }
+
+  return Math.min(2000 * 2 ** attempt, 8000);
+}
 
 /** Persist fresh tokens to OpenCode's auth store. */
 async function storeAuth(
@@ -107,13 +136,14 @@ async function storeAuth(
 async function refreshAuth(
   auth: AuthType,
   client: PluginClient,
+  options?: { force?: boolean },
 ): Promise<string | null> {
   type Tokens = { access: string; refresh: string; expires: number };
   let fresh: Tokens | null = null;
 
   // Layer 1: Claude CLI keychain
   try {
-    const kt = getClaudeTokens();
+    const kt = getClaudeTokens(options?.force === true);
     if (kt && kt.expires > Date.now() + 60_000) fresh = kt;
   } catch {}
 
@@ -170,6 +200,41 @@ function deduplicatePrefix(text: string): string {
     text = text.replace(doubled, CLAUDE_PREFIX);
   }
   return text;
+}
+
+async function logAnthropicApiError(response: Response, requestUrl: string) {
+  try {
+    const requestId = response.headers.get("request-id")
+      || response.headers.get("x-request-id");
+    const responseBody = await response.clone().text();
+    const statusLine =
+      `[opencode-oauth] Anthropic API error status=${response.status} url=${requestUrl}${requestId ? ` request-id=${requestId}` : ""}`;
+
+    console.error(statusLine);
+    if (responseBody) {
+      console.error(`[opencode-oauth] Anthropic API response: ${responseBody.slice(0, 8000)}`);
+    }
+
+    try {
+      mkdirSync(join(homedir(), ".local", "share", "opencode", "log"), {
+        recursive: true,
+      });
+      appendFileSync(
+        ANTHROPIC_ERROR_LOG_PATH,
+        [
+          `time=${new Date().toISOString()}`,
+          statusLine,
+          responseBody ? `[opencode-oauth] Anthropic API response: ${responseBody}` : "",
+          "",
+        ].filter(Boolean).join("\n") + "\n",
+        "utf8",
+      );
+    } catch (fileError) {
+      console.error(`[opencode-oauth] Failed to write API error log file: ${fileError}`);
+    }
+  } catch (error) {
+    console.error(`[opencode-oauth] Failed to read Anthropic error response: ${error}`);
+  }
 }
 
 // ── Plugin ─────────────────────────────────────────────────────────
@@ -305,11 +370,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 
                 // Inject billing header as first system block (required for OAuth)
                 if (!parsed.system) parsed.system = [];
-                const hasBilling = parsed.system.some(
-                  (s: { text?: string }) =>
-                    s.text?.startsWith("x-anthropic-billing-header:"),
-                );
-                if (!hasBilling) {
+                if (typeof parsed.system === "string") {
+                  parsed.system = [{ type: "text", text: parsed.system }];
+                }
+                const hasBilling = Array.isArray(parsed.system)
+                  && parsed.system.some(
+                    (s: { text?: string }) =>
+                      s.text?.startsWith("x-anthropic-billing-header:"),
+                  );
+                if (Array.isArray(parsed.system) && !hasBilling) {
                   // Generate content hash matching Claude CLI's format
                   const sysContent = parsed.system
                     .map((s: { text?: string }) => s.text || "")
@@ -325,7 +394,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 }
 
                 // Sanitize system prompt
-                if (parsed.system && Array.isArray(parsed.system)) {
+                if (Array.isArray(parsed.system)) {
                   parsed.system = parsed.system.map(
                     (item: { type?: string; text?: string }) => {
                       if (item.type === "text" && item.text) {
@@ -390,7 +459,7 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
             const finalUrl = requestUrl?.toString()
               ?? (input instanceof Request ? input.url : String(input));
 
-            // ── Request (with 429 auto-refresh retry) ──
+            // ── Request (with retry for retryable responses) ──
             const outHeaders: Record<string, string> = {};
             headers.forEach((v, k) => { outHeaders[k] = v; });
 
@@ -400,25 +469,23 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               headers: outHeaders,
               signal: init?.signal,
             });
-
+            
             let response = await doFetch();
 
-            // 429 auto-refresh: rate limits are per-access-token, so refreshing
-            // the token gives us a fresh rate limit bucket. Try up to 2 retries.
-            if (response.status === 429) {
-              for (let retry = 0; retry < 2; retry++) {
-                console.error(`[opencode-claude-bridge] 429 rate limited (attempt ${retry + 1}/2), refreshing token...`);
-                const freshToken = await refreshAuth(auth, client);
-                if (!freshToken) {
-                  console.error("[opencode-claude-bridge] Token refresh failed, returning 429");
-                  break;
+            for (let retry = 0; retry < 2 && RETRYABLE_STATUSES.has(response.status); retry++) {
+              if (response.status === 429) {
+                const freshToken = await refreshAuth(auth, client, { force: true });
+                if (freshToken) {
+                  outHeaders.authorization = `Bearer ${freshToken}`;
                 }
-                outHeaders["authorization"] = `Bearer ${freshToken}`;
-                // Back off briefly: 1s first retry, 2s second
-                await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
-                response = await doFetch();
-                if (response.status !== 429) break;
               }
+
+              await new Promise((resolve) => setTimeout(resolve, getResponseRetryDelayMs(response, retry)));
+              response = await doFetch();
+            }
+
+            if (!response.ok) {
+              await logAnthropicApiError(response, finalUrl);
             }
 
             // ── Strip mcp_ prefix from streaming response ──

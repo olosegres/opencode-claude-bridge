@@ -23,6 +23,25 @@ function sleep(ms: number): void {
   execSync(`sleep ${(ms / 1000).toFixed(3)}`, { timeout: 60000 });
 }
 
+function getRetryDelayMs(status: number, body: string, attempt: number): number {
+  try {
+    const parsed = JSON.parse(body) as {
+      retry_after?: number | string;
+      error?: { retry_after?: number | string };
+    };
+    const retryAfter = parsed.retry_after ?? parsed.error?.retry_after;
+    const retrySeconds = Number(retryAfter);
+
+    if (Number.isFinite(retrySeconds) && retrySeconds >= 0) {
+      return retrySeconds * 1000;
+    }
+  } catch {}
+
+  return status === 529
+    ? Math.min(2000 * 2 ** attempt, 8000)
+    : 1000 * Math.pow(2, attempt) + Math.random() * 1000;
+}
+
 /**
  * curl-based token exchange to avoid Bun/runtime fetch injecting
  * forbidden headers (Origin, Referer, Sec-Fetch-*) that trigger 429s.
@@ -33,6 +52,8 @@ function curlPost(
 ): { status: number; body: string } {
   const payload = JSON.stringify(body);
   const escaped = payload.replace(/'/g, "'\\''");
+  let lastStatus = 529;
+  let lastBody = '{"error":{"type":"overloaded_error","message":"Overloaded"}}';
 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -48,23 +69,22 @@ function curlPost(
       const parts = result.split("\n__HTTP_STATUS__");
       const status = parseInt(parts[parts.length - 1], 10);
       const responseBody = parts.slice(0, -1).join("\n__HTTP_STATUS__");
+      lastStatus = status;
+      lastBody = responseBody;
 
-      if (status !== 429 || attempt === retries - 1) {
+      if ((status !== 429 && status !== 529) || attempt === retries - 1) {
         return { status, body: responseBody };
       }
 
-      console.error(
-        `[opencode-oauth] Token endpoint 429 (attempt ${attempt + 1}/${retries}), retrying...`,
-      );
     } catch (err) {
       if (attempt === retries - 1) throw err;
     }
-    sleep(1000 * Math.pow(2, attempt) + Math.random() * 1000);
+    sleep(getRetryDelayMs(lastStatus, lastBody, attempt));
   }
 
   return {
-    status: 429,
-    body: '{"error":{"type":"rate_limit_error","message":"Rate limited"}}',
+    status: lastStatus,
+    body: lastBody,
   };
 }
 

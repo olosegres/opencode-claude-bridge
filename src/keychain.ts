@@ -47,16 +47,16 @@ export function readClaudeCredentials(): KeychainCredentials | null {
 
 /**
  * Get valid OAuth tokens from Claude CLI.
- * If expired, attempts to refresh via curl.
+ * If expired, attempts to refresh via the OAuth token endpoint.
  */
-export function getClaudeTokens(): OAuthTokens | null {
+export function getClaudeTokens(forceRefresh = false): OAuthTokens | null {
   const creds = readClaudeCredentials();
   if (!creds?.claudeAiOauth) return null;
 
   const { accessToken, refreshToken, expiresAt } = creds.claudeAiOauth;
 
   // Token still valid (60s buffer)
-  if (expiresAt > Date.now() + 60_000) {
+  if (!forceRefresh && expiresAt > Date.now() + 60_000) {
     return {
       access: accessToken,
       refresh: refreshToken,
@@ -64,15 +64,11 @@ export function getClaudeTokens(): OAuthTokens | null {
     };
   }
 
-  // Expired — try refresh
-  if (refreshToken) {
-    try {
-      console.error("[opencode-oauth] Claude CLI token expired, refreshing...");
-      return refreshTokens(refreshToken);
-    } catch (err) {
-      console.error(`[opencode-oauth] Keychain refresh failed: ${err}`);
-    }
-  }
+  if (!refreshToken) return null;
+
+  try {
+    return refreshTokens(refreshToken);
+  } catch {}
 
   return null;
 }
