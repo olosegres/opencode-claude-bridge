@@ -23,6 +23,7 @@ import {
 import { extractOAuthErrorDetail, refreshTokens } from "./oauth.js";
 import { selectClaudeCredentials } from "./keychain.js";
 import {
+  buildBetaFlags,
   default as pluginModule,
   deriveModelDisplayName,
   getClaudeToolsForActiveOpenCodeTools,
@@ -236,6 +237,33 @@ describe("Claude assistant prefill stripping", () => {
       { role: "user", content: [{ type: "text", text: "hello" }] },
     ]);
     assert.equal(out.length, 2);
+  });
+});
+
+describe("buildBetaFlags", () => {
+  it("always includes Claude Code's base beta set plus the specials", () => {
+    const out = buildBetaFlags("").split(",");
+    assert.ok(out.includes("claude-code-20250219"));
+    assert.ok(out.includes("oauth-2025-04-20"));
+    assert.ok(out.includes("interleaved-thinking-2025-05-14"));
+  });
+
+  it("forwards thinking-binding-controls only when the SDK set it in the incoming header", () => {
+    const out = buildBetaFlags(
+      "interleaved-thinking-2025-05-14,thinking-binding-controls-2026-08-01",
+    ).split(",");
+    assert.ok(out.includes("thinking-binding-controls-2026-08-01"));
+  });
+
+  it("omits thinking-binding-controls when the incoming header lacks it", () => {
+    const out = buildBetaFlags("interleaved-thinking-2025-05-14").split(",");
+    assert.ok(!out.includes("thinking-binding-controls-2026-08-01"));
+  });
+
+  it("does not duplicate a beta already present in the base set", () => {
+    const out = buildBetaFlags("claude-code-20250219,oauth-2025-04-20").split(",");
+    assert.equal(out.filter((b) => b === "claude-code-20250219").length, 1);
+    assert.equal(out.filter((b) => b === "oauth-2025-04-20").length, 1);
   });
 });
 

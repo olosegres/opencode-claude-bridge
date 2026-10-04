@@ -539,13 +539,25 @@ function mergeHeaders(target: Headers, source: HeadersInit) {
   }
 }
 
-/** Build deduplicated beta flags string. */
-function buildBetaFlags(existing: string): string {
+// Betas the patched AI SDK adds on demand that the subscription endpoint honors
+// but Claude Code's fixed BETA_FLAGS set omits. They are forwarded from the
+// incoming header ONLY when the SDK actually set them, so the request otherwise
+// stays a byte-for-byte mirror of Claude Code. thinking-binding-controls rides
+// `thinking.block_binding`; without forwarding it the endpoint rejects the field
+// with "thinking.adaptive.block_binding: Extra inputs are not permitted".
+const FORWARDED_OPTIONAL_BETAS = ["thinking-binding-controls-2026-08-01"];
+
+/** Build the deduplicated anthropic-beta header, forwarding SDK-added optional betas. */
+export function buildBetaFlags(existing: string): string {
+  const incoming = existing.split(",").map((b) => b.trim()).filter(Boolean);
   const required = BETA_FLAGS.split(",").map((b) => b.trim()).filter(Boolean);
   const withoutSpecials = required.filter(
     (beta) => beta !== "claude-code-20250219" && beta !== OAUTH_BETA_FLAG,
   );
-  return ["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials].join(",");
+  const forwarded = FORWARDED_OPTIONAL_BETAS.filter((beta) => incoming.includes(beta));
+  return [
+    ...new Set(["claude-code-20250219", OAUTH_BETA_FLAG, ...withoutSpecials, ...forwarded]),
+  ].join(",");
 }
 
 /** Deduplicate repeated Claude Code prefix in a text block. */
